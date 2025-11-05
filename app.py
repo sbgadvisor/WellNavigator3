@@ -79,7 +79,7 @@ with st.sidebar:
     # Model selection
     model = st.selectbox(
         "Model",
-        ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+        ["gpt-5", "gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
         index=0,
         help="Choose the OpenAI model to use"
     )
@@ -121,6 +121,36 @@ def prepare_messages_for_llm():
     
     return messages
 
+def get_token_param(model: str, max_tokens: int):
+    """
+    Get the correct token parameter based on model.
+    GPT-5 uses max_completion_tokens, others use max_tokens.
+    """
+    if model and model.startswith("gpt-5"):
+        return {"max_completion_tokens": max_tokens}
+    else:
+        return {"max_tokens": max_tokens}
+
+
+def get_model_params(model: str, temperature: float = 0.7, reasoning_effort: str = "medium"):
+    """
+    Get the correct model parameters based on model type.
+    GPT-5 does NOT support temperature - use reasoning_effort instead.
+    Other models use temperature.
+    
+    Args:
+        model: Model name
+        temperature: Temperature for non-GPT-5 models (ignored for GPT-5)
+        reasoning_effort: Reasoning effort for GPT-5 ("minimal", "low", "medium", "high")
+    """
+    if model and model.startswith("gpt-5"):
+        # GPT-5 uses reasoning_effort instead of temperature
+        return {"reasoning_effort": reasoning_effort}
+    else:
+        # Other models use temperature
+        return {"temperature": temperature}
+
+
 def detect_track_and_tool(user_message: str, conversation_history: list) -> dict:
     """
     Use LLM to detect which track/tool would be most helpful.
@@ -150,14 +180,16 @@ Respond ONLY with valid JSON in this exact format:
 }}"""
 
     try:
+        # Use gpt-5 for classification if available, fallback to gpt-4o-mini
+        detection_model = "gpt-5"
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=detection_model,
             messages=[
                 {"role": "system", "content": "You are a healthcare intent classifier. Respond only with valid JSON."},
                 {"role": "user", "content": detection_prompt}
             ],
-            temperature=0.3,
-            max_tokens=200
+            **get_model_params(detection_model, temperature=0.3, reasoning_effort="low"),
+            **get_token_param(detection_model, 200)
         )
         
         result = json.loads(response.choices[0].message.content)
@@ -206,14 +238,16 @@ Return "no" if:
 Respond with only "yes" or "no"."""
     
     try:
+        # Use gpt-5 for better confirmation detection
+        confirmation_model = "gpt-5"
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=confirmation_model,
             messages=[
                 {"role": "system", "content": "You are a confirmation detector for appointment booking. You must be strict - only return 'yes' for explicit booking confirmations. Respond with only 'yes' or 'no'."},
                 {"role": "user", "content": check_prompt}
             ],
-            temperature=0.1,
-            max_tokens=10
+            **get_model_params(confirmation_model, temperature=0.1, reasoning_effort="minimal"),
+            **get_token_param(confirmation_model, 10)
         )
         result = response.choices[0].message.content.strip().lower()
         return result == "yes"
@@ -308,8 +342,8 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                             ack_response = client.chat.completions.create(
                                 model=model,
                                 messages=acknowledgment_messages,
-                                temperature=temperature,
-                                max_tokens=150
+                                **get_model_params(model, temperature=temperature, reasoning_effort="low"),
+                                **get_token_param(model, 150)
                             )
                             acknowledgment = ack_response.choices[0].message.content.strip()
                             st.markdown(acknowledgment)
@@ -320,7 +354,46 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                             # Combine acknowledgment + workflow result
                             if workflow_result.get("status") == "completed":
                                 workflow_message = workflow_result.get("message", "Workflow completed.")
-                                full_response = f"{acknowledgment}\n\n{workflow_message}"
+                                
+                                # Generate natural follow-up to continue conversation
+                                follow_up_messages = [{"role": "system", "content": SYSTEM_PROMPT + f"\n\nCRITICAL: You (WellNavigator) have JUST SUCCESSFULLY completed a workflow for the user. The workflow result message is: '{workflow_message}'\n\nGenerate a brief, natural follow-up message (1-2 sentences) that:\n- Acknowledges that the workflow was successfully completed (e.g., the appointment WAS booked)\n- Offers to help with next steps related to what was just completed (e.g., preparing for the appointment, answering questions about it)\n- Keeps the conversation warm and supportive\n- Is conversational, not formal\n- Do NOT contradict what just happened - if an appointment was booked, acknowledge it was booked successfully\n- Do NOT repeat information already shown in the workflow details above\n- Just transition naturally to offer continued support"}]
+                                # Add conversation history including the acknowledgment and workflow completion
+                                for msg in st.session_state.messages:
+                                    follow_up_messages.append({
+                                        "role": msg["role"],
+                                        "content": msg["content"]
+                                    })
+                                follow_up_messages.append({
+                                    "role": "assistant",
+                                    "content": f"{acknowledgment}\n\n{workflow_message}"
+                                })
+                                
+                                try:
+                                    # Handle GPT-5 vs other models
+                                    if model and model.startswith("gpt-5"):
+                                        follow_up_response = client.chat.completions.create(
+                                            model=model,
+                                            messages=follow_up_messages,
+                                            reasoning_effort="low",
+                                            max_completion_tokens=100
+                                        )
+                                    else:
+                                        follow_up_response = client.chat.completions.create(
+                                            model=model,
+                                            messages=follow_up_messages,
+                                            temperature=temperature,
+                                            max_tokens=100
+                                        )
+                                    follow_up = follow_up_response.choices[0].message.content.strip()
+                                    
+                                    # Display follow-up
+                                    st.markdown(follow_up)
+                                    
+                                    # Combine all parts for chat history
+                                    full_response = f"{acknowledgment}\n\n{workflow_message}\n\n{follow_up}"
+                                except Exception:
+                                    # If follow-up fails, just use acknowledgment + workflow message
+                                    full_response = f"{acknowledgment}\n\n{workflow_message}"
                                 
                                 st.session_state.messages.append({
                                     "role": "assistant",
@@ -367,8 +440,8 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                             ack_response = client.chat.completions.create(
                                 model=model,
                                 messages=acknowledgment_messages,
-                                temperature=temperature,
-                                max_tokens=150  # Keep it brief but natural
+                                **get_model_params(model, temperature=temperature, reasoning_effort="low"),
+                                **get_token_param(model, 150)  # Keep it brief but natural
                             )
                             acknowledgment = ack_response.choices[0].message.content.strip()
                             
@@ -381,7 +454,46 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                             # Combine acknowledgment + workflow result for chat history
                             if workflow_result.get("status") == "completed":
                                 workflow_message = workflow_result.get("message", "Workflow completed.")
-                                full_response = f"{acknowledgment}\n\n{workflow_message}"
+                                
+                                # Generate natural follow-up to continue conversation
+                                follow_up_messages = [{"role": "system", "content": SYSTEM_PROMPT + f"\n\nCRITICAL: You (WellNavigator) have JUST SUCCESSFULLY completed a workflow for the user. The workflow result message is: '{workflow_message}'\n\nGenerate a brief, natural follow-up message (1-2 sentences) that:\n- Acknowledges that the workflow was successfully completed (e.g., the appointment WAS booked)\n- Offers to help with next steps related to what was just completed (e.g., preparing for the appointment, answering questions about it)\n- Keeps the conversation warm and supportive\n- Is conversational, not formal\n- Do NOT contradict what just happened - if an appointment was booked, acknowledge it was booked successfully\n- Do NOT repeat information already shown in the workflow details above\n- Just transition naturally to offer continued support"}]
+                                # Add conversation history including the acknowledgment and workflow completion
+                                for msg in st.session_state.messages:
+                                    follow_up_messages.append({
+                                        "role": msg["role"],
+                                        "content": msg["content"]
+                                    })
+                                follow_up_messages.append({
+                                    "role": "assistant",
+                                    "content": f"{acknowledgment}\n\n{workflow_message}"
+                                })
+                                
+                                try:
+                                    # Handle GPT-5 vs other models
+                                    if model and model.startswith("gpt-5"):
+                                        follow_up_response = client.chat.completions.create(
+                                            model=model,
+                                            messages=follow_up_messages,
+                                            reasoning_effort="low",
+                                            max_completion_tokens=100
+                                        )
+                                    else:
+                                        follow_up_response = client.chat.completions.create(
+                                            model=model,
+                                            messages=follow_up_messages,
+                                            temperature=temperature,
+                                            max_tokens=100
+                                        )
+                                    follow_up = follow_up_response.choices[0].message.content.strip()
+                                    
+                                    # Display follow-up
+                                    st.markdown(follow_up)
+                                    
+                                    # Combine all parts for chat history
+                                    full_response = f"{acknowledgment}\n\n{workflow_message}\n\n{follow_up}"
+                                except Exception:
+                                    # If follow-up fails, just use acknowledgment + workflow message
+                                    full_response = f"{acknowledgment}\n\n{workflow_message}"
                                 
                                 # Add to chat history
                                 st.session_state.messages.append({
@@ -419,10 +531,15 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                         messages_for_api = prepare_messages_for_llm()
                         
                         # Stream response
+                        # Prepare model-specific parameters
+                        model_params = get_model_params(model, temperature=temperature, reasoning_effort="medium")
+                        token_params = get_token_param(model, 2000)  # Reasonable default for streaming
+                        
                         stream = client.chat.completions.create(
                             model=model,
                             messages=messages_for_api,
-                            temperature=temperature,
+                            **model_params,
+                            **token_params,
                             stream=True
                         )
                         

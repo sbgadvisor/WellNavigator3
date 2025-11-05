@@ -121,14 +121,32 @@ Respond ONLY with valid JSON in this exact format:
 }}"""
 
         try:
+            # Use gpt-5 for better intent detection
+            detection_model = "gpt-5"
+            
+            # Helper functions for GPT-5 parameter handling
+            def get_token_param(model: str, max_tokens: int):
+                """Get the correct token parameter based on model"""
+                if model and model.startswith("gpt-5"):
+                    return {"max_completion_tokens": max_tokens}
+                else:
+                    return {"max_tokens": max_tokens}
+            
+            def get_model_params(model: str, temperature: float = 0.7, reasoning_effort: str = "medium"):
+                """Get the correct model parameters based on model type"""
+                if model and model.startswith("gpt-5"):
+                    return {"reasoning_effort": reasoning_effort}
+                else:
+                    return {"temperature": temperature}
+            
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=detection_model,
                 messages=[
                     {"role": "system", "content": "You are an intent classifier. Respond only with valid JSON. Be strict - only return true for explicit booking requests."},
                     {"role": "user", "content": detection_prompt}
                 ],
-                temperature=0.2,  # Low temperature for consistent classification
-                max_tokens=200
+                **get_model_params(detection_model, temperature=0.2, reasoning_effort="low"),
+                **get_token_param(detection_model, 200)
             )
             
             result = json.loads(response.choices[0].message.content)
@@ -175,7 +193,7 @@ Respond ONLY with valid JSON in this exact format:
         location = "Wellness Medical Center, 123 Health Street, Suite 200"
         appointment_type = "General Consultation"
         
-        # Display appointment details in a conversational, integrated way
+        # Display the appointment details in a clean, integrated way
         st.markdown("")
         with st.container():
             st.markdown("**✅ Your appointment is confirmed!**")
@@ -195,6 +213,10 @@ Respond ONLY with valid JSON in this exact format:
         
         st.markdown("")
         st.caption("💡 *Note: This is a demonstration. In the future, you'll be able to select your preferred date, time, and provider.*")
+        
+        # Small delay to show the workflow UI
+        import time
+        time.sleep(0.5)
         
         return {
             "status": "completed",
