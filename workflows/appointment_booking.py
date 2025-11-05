@@ -168,10 +168,6 @@ Respond ONLY with valid JSON in this exact format:
         Execute appointment booking workflow.
         For now, this is a stub showing a prebooked appointment.
         """
-        st.markdown("### 📅 Appointment Booking")
-        st.markdown("I'm helping you with appointment booking.")
-        st.markdown("---")
-        
         # Mock prebooked appointment
         appointment_date = datetime.now() + timedelta(days=7)
         appointment_time = "10:00 AM"
@@ -179,11 +175,12 @@ Respond ONLY with valid JSON in this exact format:
         location = "Wellness Medical Center, 123 Health Street, Suite 200"
         appointment_type = "General Consultation"
         
-        # Display the prebooked appointment
-        st.success("✅ Appointment Booked Successfully!")
-        
+        # Display appointment details in a conversational, integrated way
+        st.markdown("")
         with st.container():
-            st.markdown("#### Your Appointment Details:")
+            st.markdown("**✅ Your appointment is confirmed!**")
+            st.markdown("")
+            
             col1, col2 = st.columns(2)
             
             with col1:
@@ -196,12 +193,8 @@ Respond ONLY with valid JSON in this exact format:
                 st.markdown(f"**Location:** {location}")
                 st.markdown(f"**Appointment ID:** APT-{appointment_date.strftime('%Y%m%d')}-001")
         
-        st.markdown("---")
-        st.info("💡 **Note:** This is a demonstration. In the future, you'll be able to select your preferred date, time, and provider.")
-        
-        # Small delay to show the workflow UI
-        import time
-        time.sleep(0.5)
+        st.markdown("")
+        st.caption("💡 *Note: This is a demonstration. In the future, you'll be able to select your preferred date, time, and provider.*")
         
         return {
             "status": "completed",

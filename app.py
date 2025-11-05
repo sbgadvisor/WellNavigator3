@@ -6,7 +6,6 @@ import json
 from typing import List, Dict
 
 from prompts import SYSTEM_PROMPT, WELCOME_MESSAGE, DISCLAIMER
-from tools import TOOLS, AppointmentTool, ResultsTool, ResourcesTool, CaregiverTool
 from workflows import WORKFLOW_REGISTRY, get_workflow
 
 # Load environment variables
@@ -168,8 +167,8 @@ Respond ONLY with valid JSON in this exact format:
 
 def detect_confirmation(user_message: str, conversation_context: List[Dict[str, str]]) -> bool:
     """
-    Surgically detect if user is confirming a previously offered workflow.
-    Returns True if user's message indicates confirmation/agreement.
+    Surgically detect if user is confirming APPOINTMENT BOOKING (not just general guidance).
+    Must check full context to see what was actually offered.
     """
     if not client:
         return False
@@ -180,89 +179,83 @@ def detect_confirmation(user_message: str, conversation_context: List[Dict[str, 
                             "that works", "let's do it", "let's do that", "i'd like that",
                             "please", "that would be great", "sounds great"]
     
-    if any(keyword in message_lower for keyword in confirmation_keywords):
-        # Use LLM to verify it's actually a confirmation in context (surgical check)
-        check_prompt = f"""User message: "{user_message}"
-
-Previous conversation context suggests the assistant just offered to help with something (like booking an appointment).
-
-Does the user's message indicate they are confirming/agreeing to proceed? 
-Respond with only "yes" or "no"."""
-        
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a confirmation detector. Respond with only 'yes' or 'no'."},
-                    {"role": "user", "content": check_prompt}
-                ],
-                temperature=0.1,
-                max_tokens=10
-            )
-            result = response.choices[0].message.content.strip().lower()
-            return result == "yes"
-        except:
-            # Fallback to keyword match if LLM fails
-            return True
+    if not any(keyword in message_lower for keyword in confirmation_keywords):
+        return False
     
-    return False
+    # Use LLM to verify it's actually a BOOKING confirmation, not general guidance confirmation
+    context_text = "\n".join([
+        f"{msg.get('role', 'user')}: {msg.get('content', '')[:200]}"
+        for msg in conversation_context[-4:]  # Last 4 messages for context
+    ])
+    
+    check_prompt = f"""You are detecting if a user is confirming they want to BOOK/SCHEDULE an appointment (not just get guidance).
+
+Recent conversation:
+{context_text}
+
+User's latest message: "{user_message}"
+
+CRITICAL: Only return "yes" if the assistant explicitly offered to HELP BOOK/SCHEDULE an appointment AND the user is confirming that booking request.
+
+Return "no" if:
+- The assistant only offered guidance/preparation help (even if it mentioned appointments)
+- The assistant only suggested seeing a doctor (without offering to book)
+- The user is just confirming they want more information/guidance
+- The user is confirming something else entirely
+
+Respond with only "yes" or "no"."""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a confirmation detector for appointment booking. You must be strict - only return 'yes' for explicit booking confirmations. Respond with only 'yes' or 'no'."},
+                {"role": "user", "content": check_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=10
+        )
+        result = response.choices[0].message.content.strip().lower()
+        return result == "yes"
+    except:
+        # Fallback: be conservative - don't trigger if we can't verify
+        return False
 
 def detect_appointment_offer_in_response(response: str) -> bool:
     """
-    Detect if chatbot's response offered to help with appointment booking.
-    This is a simple check to track when we should listen for confirmations.
+    Detect if chatbot's response offered to help with appointment BOOKING (not just appointment-related guidance).
+    This should only trigger on explicit booking offers, not general appointment discussion.
     """
     response_lower = response.lower()
-    # Look for patterns like "help booking", "book an appointment", "schedule", etc.
-    offer_patterns = [
-        "book" in response_lower and "appointment" in response_lower,
-        "schedule" in response_lower and "appointment" in response_lower,
-        "help you book" in response_lower,
-        "help with booking" in response_lower,
-        ("appointment" in response_lower and ("help" in response_lower or "can" in response_lower))
+    
+    # Only trigger on explicit booking/scheduling offers
+    # Must have both "book"/"schedule" AND "appointment" in close context
+    explicit_booking_phrases = [
+        "help you book",
+        "help with booking",
+        "help booking",
+        "book an appointment",
+        "schedule an appointment",
+        "make an appointment",
+        "book your appointment",
+        "schedule your appointment",
+        "can book",
+        "can schedule"
     ]
-    return any(offer_patterns)
-
-def format_tool_result(tool_result: dict) -> str:
-    """Format tool result into a readable response"""
-    data = tool_result.get("data", {})
-    tool_type = tool_result.get("tool", "")
     
-    if tool_type == "appointment_preparation":
-        result_text = f"## {data.get('title', 'Appointment Preparation Guide')}\n\n"
-        result_text += "**Checklist:**\n"
-        for item in data.get("checklist", []):
-            result_text += f"- {item}\n"
-        result_text += f"\n💡 **Tip:** {data.get('tips', '')}\n"
-        return result_text
+    # Check if any explicit booking phrase exists
+    has_booking_offer = any(phrase in response_lower for phrase in explicit_booking_phrases)
     
-    elif tool_type == "results_explanation":
-        result_text = f"## {data.get('title', 'Understanding Your Results')}\n\n"
-        if "common_components" in data:
-            result_text += "**Common components:**\n"
-            for item in data["common_components"]:
-                result_text += f"- {item}\n"
-            result_text += "\n"
-        result_text += f"{data.get('general_advice', '')}\n\n"
-        result_text += f"**Questions to ask:** {data.get('when_to_ask', '')}\n"
-        return result_text
+    # Exclude if it's just about preparation/guidance for appointments (not booking)
+    is_preparation_only = any(phrase in response_lower for phrase in [
+        "prepare for",
+        "preparation",
+        "guidance on",
+        "what to do",
+        "how to prepare"
+    ]) and not has_booking_offer
     
-    elif tool_type == "resource_finder":
-        result_text = f"## {data.get('title', 'Resources')}\n\n"
-        for resource in data.get("resources", []):
-            result_text += f"- {resource}\n"
-        result_text += f"\n💡 **Tip:** {data.get('tips', '')}\n"
-        return result_text
-    
-    elif tool_type == "caregiver_support":
-        result_text = f"## {data.get('title', 'Caregiver Support')}\n\n"
-        for advice in data.get("advice", []):
-            result_text += f"- {advice}\n"
-        result_text += f"\n**Resources:** {data.get('resources', '')}\n"
-        return result_text
-    
-    else:
-        return tool_result.get("message", "I've gathered some information for you.")
+    return has_booking_offer and not is_preparation_only
 
 # Show welcome message if not shown yet
 if not st.session_state.welcome_shown and len(st.session_state.messages) == 0:
@@ -301,24 +294,47 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                 if workflow:
                     workflow_triggered = True
                     
-                    # Execute the workflow
+                    # Get natural acknowledgment for confirmation
                     with st.chat_message("assistant"):
-                        workflow_result = workflow.execute({"intent": "confirmed"})
-                        
-                        # Add workflow result message to chat
-                        if workflow_result.get("status") == "completed":
-                            workflow_message = workflow_result.get("message", "Workflow completed.")
-                            
-                            # Display workflow result in chat
-                            st.markdown(workflow_message)
-                            
-                            # Add to chat history
-                            st.session_state.messages.append({
-                                "role": "assistant",
-                                "content": workflow_message
+                        # Prepare messages for acknowledgment - explicitly state that we WILL book the appointment
+                        acknowledgment_messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\nIMPORTANT: The user has confirmed they want to book an appointment, and you (WellNavigator) WILL be booking it for them through the appointment booking system. Acknowledge their confirmation warmly and confirm that you're helping them book it (1-2 sentences max). Do NOT say you cannot book - you ARE booking it. Be conversational and brief."}]
+                        for msg in st.session_state.messages:
+                            acknowledgment_messages.append({
+                                "role": msg["role"],
+                                "content": msg["content"]
                             })
+                        
+                        try:
+                            ack_response = client.chat.completions.create(
+                                model=model,
+                                messages=acknowledgment_messages,
+                                temperature=temperature,
+                                max_tokens=150
+                            )
+                            acknowledgment = ack_response.choices[0].message.content.strip()
+                            st.markdown(acknowledgment)
                             
-                            # Note: Re-engagement is now handled naturally by the LLM when appropriate
+                            # Execute the workflow
+                            workflow_result = workflow.execute({"intent": "confirmed"})
+                            
+                            # Combine acknowledgment + workflow result
+                            if workflow_result.get("status") == "completed":
+                                workflow_message = workflow_result.get("message", "Workflow completed.")
+                                full_response = f"{acknowledgment}\n\n{workflow_message}"
+                                
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": full_response
+                                })
+                        except Exception as e:
+                            # Fallback: just execute workflow
+                            workflow_result = workflow.execute({"intent": "confirmed"})
+                            if workflow_result.get("status") == "completed":
+                                workflow_message = workflow_result.get("message", "Workflow completed.")
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": workflow_message
+                                })
                     
                     # Clear the offered state
                     st.session_state.appointment_offered = False
@@ -336,24 +352,51 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                 if trigger_info.get("should_trigger") and trigger_info.get("confidence") == "high":
                     workflow_triggered = True
                     
-                    # Execute the workflow
+                    # First, get a natural conversational acknowledgment from the LLM
                     with st.chat_message("assistant"):
-                        workflow_result = workflow.execute(trigger_info.get("context", {}))
-                        
-                        # Add workflow result message to chat
-                        if workflow_result.get("status") == "completed":
-                            workflow_message = workflow_result.get("message", "Workflow completed.")
-                            
-                            # Display workflow result in chat
-                            st.markdown(workflow_message)
-                            
-                            # Add to chat history
-                            st.session_state.messages.append({
-                                "role": "assistant",
-                                "content": workflow_message
+                        # Prepare messages for acknowledgment - explicitly state that we WILL book the appointment
+                        acknowledgment_messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\nIMPORTANT: The user has requested to book an appointment, and you (WellNavigator) WILL be booking it for them through the appointment booking system. Acknowledge their request warmly and confirm that you're helping them book it (1-2 sentences max). Do NOT say you cannot book - you ARE booking it. Be conversational and brief."}]
+                        for msg in st.session_state.messages:
+                            acknowledgment_messages.append({
+                                "role": msg["role"],
+                                "content": msg["content"]
                             })
+                        
+                        # Get brief acknowledgment
+                        try:
+                            ack_response = client.chat.completions.create(
+                                model=model,
+                                messages=acknowledgment_messages,
+                                temperature=temperature,
+                                max_tokens=150  # Keep it brief but natural
+                            )
+                            acknowledgment = ack_response.choices[0].message.content.strip()
                             
-                            # Note: Re-engagement is now handled naturally by the LLM when appropriate
+                            # Display acknowledgment
+                            st.markdown(acknowledgment)
+                            
+                            # Now execute the workflow seamlessly
+                            workflow_result = workflow.execute(trigger_info.get("context", {}))
+                            
+                            # Combine acknowledgment + workflow result for chat history
+                            if workflow_result.get("status") == "completed":
+                                workflow_message = workflow_result.get("message", "Workflow completed.")
+                                full_response = f"{acknowledgment}\n\n{workflow_message}"
+                                
+                                # Add to chat history
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": full_response
+                                })
+                        except Exception as e:
+                            # Fallback: just execute workflow if acknowledgment fails
+                            workflow_result = workflow.execute(trigger_info.get("context", {}))
+                            if workflow_result.get("status") == "completed":
+                                workflow_message = workflow_result.get("message", "Workflow completed.")
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": workflow_message
+                                })
                     
                     break  # Only one workflow at a time
     
@@ -402,10 +445,6 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
                         if detect_appointment_offer_in_response(response):
                             st.session_state.appointment_offered = True
                             st.session_state.offered_workflow_id = "appointment_booking"
-                        
-                        # Note: Automatic tool invocation removed - tools should only be invoked via workflows
-                        # or when explicitly requested by the user. The LLM handles conversational support naturally.
-                        # Re-engagement is now handled naturally by the LLM when appropriate.
                         
                         # Update placeholder with final response (without cursor)
                         response_placeholder.markdown(response)
