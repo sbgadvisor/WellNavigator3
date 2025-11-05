@@ -79,7 +79,7 @@ with st.sidebar:
     # Model selection
     model = st.selectbox(
         "Model",
-        ["gpt-5", "gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+        ["gpt-4o", "gpt-5", "gpt-4o-mini", "gpt-3.5-turbo"],
         index=0,
         help="Choose the OpenAI model to use"
     )
