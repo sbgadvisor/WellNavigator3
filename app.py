@@ -3,9 +3,11 @@ import openai
 from dotenv import load_dotenv
 import os
 import json
+from typing import List, Dict
 
 from prompts import SYSTEM_PROMPT, WELCOME_MESSAGE, DISCLAIMER
 from tools import TOOLS, AppointmentTool, ResultsTool, ResourcesTool, CaregiverTool
+from workflows import WORKFLOW_REGISTRY, get_workflow
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +32,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
     st.session_state.welcome_shown = False
     st.session_state.conversation_context = {}
+    st.session_state.appointment_offered = False
+    st.session_state.offered_workflow_id = None
 
 # Custom CSS for better UI
 st.markdown("""
@@ -54,15 +58,11 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Header with disclaimer
+# Header
 st.markdown(f"""
     <div class="main-header">
         <h1 style="margin:0; color: white;">💚 WellNavigator</h1>
         <p style="margin:0.5rem 0 0 0; color: white; font-size: 1.1rem;">Your empathetic healthcare navigation companion</p>
-    </div>
-    <div class="disclaimer-box">
-        <strong>⚠️ Important:</strong> I'm here to help guide and support you, but I'm not a doctor. 
-        Always consult with healthcare professionals for medical advice.
     </div>
 """, unsafe_allow_html=True)
 
@@ -102,6 +102,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.welcome_shown = False
         st.session_state.conversation_context = {}
+        st.session_state.appointment_offered = False
+        st.session_state.offered_workflow_id = None
         st.rerun()
     
     st.markdown("---")
@@ -163,6 +165,63 @@ Respond ONLY with valid JSON in this exact format:
         return result
     except Exception as e:
         return None
+
+def detect_confirmation(user_message: str, conversation_context: List[Dict[str, str]]) -> bool:
+    """
+    Surgically detect if user is confirming a previously offered workflow.
+    Returns True if user's message indicates confirmation/agreement.
+    """
+    if not client:
+        return False
+    
+    # Simple keyword check first (fast)
+    message_lower = user_message.lower()
+    confirmation_keywords = ["yes", "yeah", "yep", "sure", "okay", "ok", "sounds good", 
+                            "that works", "let's do it", "let's do that", "i'd like that",
+                            "please", "that would be great", "sounds great"]
+    
+    if any(keyword in message_lower for keyword in confirmation_keywords):
+        # Use LLM to verify it's actually a confirmation in context (surgical check)
+        check_prompt = f"""User message: "{user_message}"
+
+Previous conversation context suggests the assistant just offered to help with something (like booking an appointment).
+
+Does the user's message indicate they are confirming/agreeing to proceed? 
+Respond with only "yes" or "no"."""
+        
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a confirmation detector. Respond with only 'yes' or 'no'."},
+                    {"role": "user", "content": check_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=10
+            )
+            result = response.choices[0].message.content.strip().lower()
+            return result == "yes"
+        except:
+            # Fallback to keyword match if LLM fails
+            return True
+    
+    return False
+
+def detect_appointment_offer_in_response(response: str) -> bool:
+    """
+    Detect if chatbot's response offered to help with appointment booking.
+    This is a simple check to track when we should listen for confirmations.
+    """
+    response_lower = response.lower()
+    # Look for patterns like "help booking", "book an appointment", "schedule", etc.
+    offer_patterns = [
+        "book" in response_lower and "appointment" in response_lower,
+        "schedule" in response_lower and "appointment" in response_lower,
+        "help you book" in response_lower,
+        "help with booking" in response_lower,
+        ("appointment" in response_lower and ("help" in response_lower or "can" in response_lower))
+    ]
+    return any(offer_patterns)
 
 def format_tool_result(tool_result: dict) -> str:
     """Format tool result into a readable response"""
@@ -227,100 +286,145 @@ if prompt := st.chat_input("Tell me what's going on—how can I support you toda
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Generate assistant response
+    # Check for workflow triggers first
+    workflow_triggered = False
+    workflow_result = None
+    
     if client:
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Detect track/tool if we have enough context
-                    track_info = None
-                    if len(st.session_state.messages) >= 2:
-                        track_info = detect_track_and_tool(
-                            prompt,
-                            st.session_state.messages
-                        )
+        # FIRST: Check if a workflow was previously offered and user is confirming
+        if st.session_state.get("appointment_offered") and st.session_state.get("offered_workflow_id"):
+            if detect_confirmation(prompt, st.session_state.messages[-3:]):
+                # User confirmed - trigger the offered workflow
+                workflow_id = st.session_state.offered_workflow_id
+                workflow = get_workflow(workflow_id)
+                
+                if workflow:
+                    workflow_triggered = True
                     
-                    # Prepare messages for API (includes system prompt)
-                    messages_for_api = prepare_messages_for_llm()
-                    
-                    # If track is detected with high confidence and user seems to want action,
-                    # we can enhance the prompt
-                    enhanced_prompt = prompt
-                    if track_info and track_info.get("confidence") == "high":
-                        track = track_info.get("track")
-                        if track in ["appointment", "results", "resources", "caregiver"]:
-                            # Add context about available tools
-                            enhanced_prompt = f"{prompt}\n\n[Context: The user seems to need help with {track}. If appropriate, suggest using relevant tools or guidance.]"
-                    
-                    # Update the last message with enhanced prompt
-                    messages_for_api[-1]["content"] = enhanced_prompt
-                    
-                    # Stream response
-                    stream = client.chat.completions.create(
-                        model=model,
-                        messages=messages_for_api,
-                        temperature=temperature,
-                        stream=True
-                    )
-                    
-                    # Collect streamed response
-                    response_parts = []
-                    response_placeholder = st.empty()
-                    full_response = ""
-                    
-                    for chunk in stream:
-                        if chunk.choices[0].delta.content is not None:
-                            content = chunk.choices[0].delta.content
-                            response_parts.append(content)
-                            full_response = "".join(response_parts)
-                            response_placeholder.markdown(full_response + "▌")
-                    
-                    response_placeholder.markdown(full_response)
-                    response = full_response
-                    
-                    # Check if user wants to use a tool (simple keyword detection + LLM reasoning)
-                    # This is a simplified version - in production, you'd use function calling
-                    use_tool = False
-                    tool_result = None
-                    
-                    # Check if response suggests using a tool or if track detection suggests it
-                    if track_info and track_info.get("confidence") in ["high", "medium"]:
-                        track = track_info.get("track")
-                        lower_response = response.lower()
+                    # Execute the workflow
+                    with st.chat_message("assistant"):
+                        workflow_result = workflow.execute({"intent": "confirmed"})
                         
-                        # Simple heuristics - in production, use OpenAI function calling
-                        if track == "appointment" and any(word in lower_response for word in ["prepar", "checklist", "guide", "appointment"]):
-                            tool_result = AppointmentTool.prepare_appointment_guide()
-                            use_tool = True
-                        elif track == "results" and any(word in lower_response for word in ["result", "test", "explain", "understand"]):
-                            tool_result = ResultsTool.explain_results()
-                            use_tool = True
-                        elif track == "resources" and any(word in lower_response for word in ["resource", "support", "help", "find"]):
-                            tool_result = ResourcesTool.find_resources()
-                            use_tool = True
-                        elif track == "caregiver" and any(word in lower_response for word in ["caregiv", "support", "help"]):
-                            tool_result = CaregiverTool.provide_caregiver_guidance()
-                            use_tool = True
+                        # Add workflow result message to chat
+                        if workflow_result.get("status") == "completed":
+                            workflow_message = workflow_result.get("message", "Workflow completed.")
+                            
+                            # Display workflow result in chat
+                            st.markdown(workflow_message)
+                            
+                            # Add to chat history
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": workflow_message
+                            })
+                            
+                            # Note: Re-engagement is now handled naturally by the LLM when appropriate
                     
-                    # Append tool result if available
-                    if use_tool and tool_result:
-                        response += "\n\n" + format_tool_result(tool_result)
+                    # Clear the offered state
+                    st.session_state.appointment_offered = False
+                    st.session_state.offered_workflow_id = None
+        
+        # SECOND: Check for direct workflow triggers (explicit user requests)
+        if not workflow_triggered:
+            for workflow_id, workflow in WORKFLOW_REGISTRY.items():
+                trigger_info = workflow.should_trigger(
+                    user_message=prompt,
+                    conversation_context=st.session_state.messages[-5:]  # Last 5 messages for context
+                )
+                
+                # Only trigger if confidence is high and workflow says it should trigger
+                if trigger_info.get("should_trigger") and trigger_info.get("confidence") == "high":
+                    workflow_triggered = True
                     
-                    # Always add re-engagement at the end
-                    response += f"\n\n{DISCLAIMER}\n\n"
-                    response += "Would you like to talk about anything else—maybe your test results, appointment preparation, or finding additional resources? I'm here to help."
+                    # Execute the workflow
+                    with st.chat_message("assistant"):
+                        workflow_result = workflow.execute(trigger_info.get("context", {}))
+                        
+                        # Add workflow result message to chat
+                        if workflow_result.get("status") == "completed":
+                            workflow_message = workflow_result.get("message", "Workflow completed.")
+                            
+                            # Display workflow result in chat
+                            st.markdown(workflow_message)
+                            
+                            # Add to chat history
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": workflow_message
+                            })
+                            
+                            # Note: Re-engagement is now handled naturally by the LLM when appropriate
                     
-                    # Add assistant response to chat history
-                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    break  # Only one workflow at a time
+    
+    # If no workflow was triggered, proceed with normal chat
+    if not workflow_triggered:
+        # Generate assistant response
+        if client:
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        # Detect track/tool if we have enough context
+                        track_info = None
+                        if len(st.session_state.messages) >= 2:
+                            track_info = detect_track_and_tool(
+                                prompt,
+                                st.session_state.messages
+                            )
+                        
+                        # Prepare messages for API (includes system prompt)
+                        messages_for_api = prepare_messages_for_llm()
+                        
+                        # Stream response
+                        stream = client.chat.completions.create(
+                            model=model,
+                            messages=messages_for_api,
+                            temperature=temperature,
+                            stream=True
+                        )
+                        
+                        # Collect streamed response
+                        response_parts = []
+                        response_placeholder = st.empty()
+                        full_response = ""
+                        
+                        for chunk in stream:
+                            if chunk.choices[0].delta.content is not None:
+                                content = chunk.choices[0].delta.content
+                                response_parts.append(content)
+                                full_response = "".join(response_parts)
+                                response_placeholder.markdown(full_response + "▌")
+                        
+                        # Finalize the response
+                        response = full_response
+                        
+                        # Track if chatbot offered appointment booking (for conversational workflow triggering)
+                        if detect_appointment_offer_in_response(response):
+                            st.session_state.appointment_offered = True
+                            st.session_state.offered_workflow_id = "appointment_booking"
+                        
+                        # Note: Automatic tool invocation removed - tools should only be invoked via workflows
+                        # or when explicitly requested by the user. The LLM handles conversational support naturally.
+                        # Re-engagement is now handled naturally by the LLM when appropriate.
+                        
+                        # Update placeholder with final response (without cursor)
+                        response_placeholder.markdown(response)
+                        
+                        # Add assistant response to chat history AFTER finalizing
+                        st.session_state.messages.append({"role": "assistant", "content": response})
                     
-                except Exception as e:
-                    error_message = f"I apologize, but I encountered an error: {str(e)}\n\nPlease try again, or rephrase your question."
-                    st.error(error_message)
-                    st.session_state.messages.append({"role": "assistant", "content": error_message})
-    else:
-        with st.chat_message("assistant"):
-            st.error("OpenAI API client not available. Please configure your API key in the .env file.")
+                    except Exception as e:
+                        error_message = f"I apologize, but I encountered an error: {str(e)}\n\nPlease try again, or rephrase your question."
+                        st.error(error_message)
+                        st.session_state.messages.append({"role": "assistant", "content": error_message})
+        else:
+            with st.chat_message("assistant"):
+                st.error("OpenAI API client not available. Please configure your API key in the .env file.")
 
-# Footer
+# Footer with disclaimer
 st.markdown("---")
-st.caption("💚 WellNavigator - Making healthcare less overwhelming, one conversation at a time.")
+footer_col1, footer_col2 = st.columns([3, 1])
+with footer_col1:
+    st.caption("💚 WellNavigator - Making healthcare less overwhelming, one conversation at a time.")
+with footer_col2:
+    st.caption(f"<span style='font-size: 0.85em; color: #666;'>{DISCLAIMER}</span>", unsafe_allow_html=True)
