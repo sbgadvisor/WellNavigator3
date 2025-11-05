@@ -78,9 +78,14 @@ User's latest message: "{user_message}"
 Recent conversation context:
 {conversation_summary}
 
-IMPORTANT: Only return TRUE if the user explicitly wants to BOOK or SCHEDULE a new appointment. Return FALSE if:
+IMPORTANT: Only return TRUE if the user explicitly wants to BOOK or SCHEDULE a new appointment. 
+
+Pay special attention to phrases like "help me make/book/schedule" - these ARE booking requests and should return TRUE.
+
+Return FALSE if:
 - User is asking how to PREPARE for an appointment (already scheduled)
 - User is asking ABOUT an appointment (questions, concerns, what to expect)
+- User is asking to UNDERSTAND something about an appointment
 - User mentions appointments in general without wanting to book
 - User is discussing a past or existing appointment
 
@@ -90,6 +95,14 @@ Examples that should return TRUE:
 - "I want to see a doctor"
 - "How do I make an appointment?"
 - "I'd like to schedule something"
+- "Can you help me in making this appointment?"
+- "Can you help me make an appointment?"
+- "Can you help me book an appointment?"
+- "Help me schedule an appointment"
+- "I need help making an appointment"
+- "Will you help me book this appointment?"
+- "Can you help with booking?"
+- Any request where user asks for help WITH booking/making/scheduling an appointment
 
 Examples that should return FALSE:
 - "I'm not sure how to prepare for that appointment"
@@ -97,6 +110,8 @@ Examples that should return FALSE:
 - "I have questions about my appointment"
 - "What will happen at the appointment?"
 - "I'm nervous about my appointment"
+- "Can you help me understand my appointment?" (understanding vs booking)
+- "Help me prepare for my appointment" (preparation vs booking)
 
 Respond ONLY with valid JSON in this exact format:
 {{
